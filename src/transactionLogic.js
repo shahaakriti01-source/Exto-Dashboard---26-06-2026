@@ -1,20 +1,20 @@
 // ─── TRANSACTION CLASSIFICATION & PAIRING LOGIC ─────────────────────────────
 // Based on the 12 transaction types in the Payments Transaction sheet.
-
+ 
 export const EXTO_BACKEND_ID = "rPezy2QDaNVDJ5LpABXpqAMiWPrricuKwW"; // "Exto Backend ID - Pay"
 export const EXTO_BACKEND_ONBOARD_ID = "rHBFTaCH4Pcm3D5bSMH8nq6iibanr8vkKE"; // "Exto Backend ID - Onboard"
 export const EXTO_BACKEND_NAME = "Exto Backend ID";
-
+ 
 // Always-counted types (no pairing needed — always successful, standalone)
 export const ALWAYS_COUNT_TYPES = new Set(["Online Remote", "Offline Final"]);
-
+ 
 // Types that require pairing/reconciliation against a possible failure counterpart.
 // Key = provisional type, Value = the failure type that, if matched, excludes the transaction.
 export const PAIR_TYPES = {
   "Online Revokable": "Online Revoked",
   "Online Returnable": "Online Returned",
 };
-
+ 
 // Types never counted for processing/activation/milestone incentives at all
 // (internal transfers, top-ups, cash-outs, and precursor/already-counted states)
 export const EXCLUDED_TYPES = new Set([
@@ -24,9 +24,9 @@ export const EXCLUDED_TYPES = new Set([
   "Offline Revokable", // precursor only; resolves into Offline Final
   "Online Final", // precursor already counted as Online Revokable
 ]);
-
+ 
 const MATCH_WINDOW_MINUTES = 15;
-
+ 
 function parseDLTDate(dateStr) {
   // Expected format: "D/M/YYYY, H:MM:SS am/pm" or "D/M/YYYY"
   if (!dateStr) return null;
@@ -41,12 +41,12 @@ function parseDLTDate(dateStr) {
   if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
   return new Date(year, month - 1, day, h, parseInt(m, 10), s ? parseInt(s, 10) : 0);
 }
-
+ 
 export function isExtoTransaction(p) {
   return p.account === EXTO_BACKEND_ID || p.destination === EXTO_BACKEND_ID ||
     p.sender === EXTO_BACKEND_NAME || p.receiver === EXTO_BACKEND_NAME;
 }
-
+ 
 /**
  * Returns the set of "qualifying" transactions for a merchant — i.e. transactions
  * that count toward transaction-processing incentive, activation bonus, and milestones.
@@ -63,10 +63,21 @@ export function getQualifyingTransactions(merchantName, allPayments) {
   const involved = allPayments.filter(
     p => (p.sender === merchantName || p.receiver === merchantName) && !isExtoTransaction(p)
   );
-
+ 
+  // Build a lookup of potential failure-match candidates, keyed by
+  // type+sender+receiver+amount, so each transaction can find its match in
+  // O(1) instead of re-scanning the whole array (this used to be O(n^2) on
+  // large transaction histories).
+  const candidatesByKey = new Map();
+  involved.forEach((p, i) => {
+    const key = `${p.txn_type}|${p.sender}|${p.receiver}|${p.amount}`;
+    if (!candidatesByKey.has(key)) candidatesByKey.set(key, []);
+    candidatesByKey.get(key).push(i);
+  });
+ 
   const usedAsFailureMatch = new Set();
   const qualifying = [];
-
+ 
   involved.forEach((p, i) => {
     if (ALWAYS_COUNT_TYPES.has(p.txn_type)) {
       qualifying.push(p);
@@ -74,32 +85,32 @@ export function getQualifyingTransactions(merchantName, allPayments) {
     }
     const failureType = PAIR_TYPES[p.txn_type];
     if (!failureType) return; // excluded type entirely
-
+ 
     if (usedAsFailureMatch.has(i)) return; // this row was itself consumed as someone else's match
-
+ 
     const pTime = parseDLTDate(p.dlt_close || p.created_at);
-    const matchIndex = involved.findIndex((q, j) => {
+    const failureKey = `${failureType}|${p.sender}|${p.receiver}|${p.amount}`;
+    const candidates = candidatesByKey.get(failureKey) || [];
+    const matchIndex = candidates.find(j => {
       if (j === i || usedAsFailureMatch.has(j)) return false;
-      if (q.txn_type !== failureType) return false;
-      if (q.sender !== p.sender || q.receiver !== p.receiver) return false;
-      if (q.amount !== p.amount) return false;
+      const q = involved[j];
       const qTime = parseDLTDate(q.dlt_close || q.created_at);
       if (!pTime || !qTime) return false;
       const diffMinutes = (qTime - pTime) / 60000;
       return diffMinutes >= 0 && diffMinutes <= MATCH_WINDOW_MINUTES;
     });
-
-    if (matchIndex !== -1) {
+ 
+    if (matchIndex !== undefined) {
       usedAsFailureMatch.add(matchIndex);
       // this transaction failed — excluded entirely, not added to qualifying
     } else {
       qualifying.push(p);
     }
   });
-
+ 
   return qualifying;
 }
-
+ 
 /**
  * Audits EVERY payment transaction and returns each one tagged with whether it
  * counts toward any merchant's incentive, and a plain-language reason. Used by
@@ -110,36 +121,45 @@ export function getQualifyingTransactions(merchantName, allPayments) {
  */
 export function auditTransactions(allPayments, merchantNameSet) {
   // First, work out which paired transactions get cancelled by a matching failure,
-  // globally (not per-merchant), so the audit reason is consistent.
+  // globally (not per-merchant). Uses a key-based lookup (O(1) per match attempt)
+  // instead of re-scanning the entire payments list for every paired transaction —
+  // important once the dataset grows into the thousands of rows.
+  const candidatesByKey = new Map();
+  allPayments.forEach((p, i) => {
+    const key = `${p.txn_type}|${p.sender}|${p.receiver}|${p.amount}`;
+    if (!candidatesByKey.has(key)) candidatesByKey.set(key, []);
+    candidatesByKey.get(key).push(i);
+  });
+ 
   const failureMatched = new Set();
   allPayments.forEach((p, i) => {
     const failureType = PAIR_TYPES[p.txn_type];
     if (!failureType || failureMatched.has(i)) return;
     const pTime = parseDLTDate(p.dlt_close || p.created_at);
-    const matchIndex = allPayments.findIndex((q, j) => {
+    const failureKey = `${failureType}|${p.sender}|${p.receiver}|${p.amount}`;
+    const candidates = candidatesByKey.get(failureKey) || [];
+    const matchIndex = candidates.find(j => {
       if (j === i || failureMatched.has(j)) return false;
-      if (q.txn_type !== failureType) return false;
-      if (q.sender !== p.sender || q.receiver !== p.receiver) return false;
-      if (q.amount !== p.amount) return false;
+      const q = allPayments[j];
       const qTime = parseDLTDate(q.dlt_close || q.created_at);
       if (!pTime || !qTime) return false;
       const diff = (qTime - pTime) / 60000;
       return diff >= 0 && diff <= MATCH_WINDOW_MINUTES;
     });
-    if (matchIndex !== -1) {
+    if (matchIndex !== undefined) {
       failureMatched.add(i);
       failureMatched.add(matchIndex);
     }
   });
-
+ 
   return allPayments.map((p, i) => {
     const senderIsMerchant = merchantNameSet.has(p.sender);
     const receiverIsMerchant = merchantNameSet.has(p.receiver);
     const merchant = senderIsMerchant ? p.sender : (receiverIsMerchant ? p.receiver : null);
-
+ 
     let counted = false;
     let reason = "";
-
+ 
     if (isExtoTransaction(p)) {
       reason = "Excluded — involves Exto Backend (internal/activation transfer)";
     } else if (!senderIsMerchant && !receiverIsMerchant) {
@@ -159,7 +179,7 @@ export function auditTransactions(allPayments, merchantNameSet) {
     } else {
       reason = `Excluded — "${p.txn_type}" is not an incentive-qualifying type`;
     }
-
+ 
     return { ...p, counted, reason, merchant };
   });
 }
